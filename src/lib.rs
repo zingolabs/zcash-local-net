@@ -1,10 +1,28 @@
 #![warn(missing_docs)]
-//! Zcash Localnet
+//! # Zcash Local Net
+//!
+//! ## Overview
+//!
+//! A Rust test utility crate designed to facilitate the launching and management of Zcash processes
+//! on a local network (regtest/localnet mode). This crate is ideal for integration testing in the
+//! development of light-clients/light-wallets, indexers/light-nodes and validators/full-nodes as it
+//! provides a simple and configurable interface for launching and managing other proccesses in the
+//! local network to simulate a Zcash environment.
+//!
+//! ## List of Processes
+//! - Zcashd
+//! - Zainod
+//! - Lightwalletd
+//!
+//! ## Prerequisites
+//!
+//! Ensure that any processes used in this crate are installed on your system. The binaries can be in
+//! $PATH or the path to the binaries can be specified when launching a process.
 
 use std::{fs::File, io::Read, path::PathBuf, process::Child};
 
 use error::LaunchError;
-use getset::Getters;
+use getset::{CopyGetters, Getters};
 use network::ActivationHeights;
 use portpicker::Port;
 use tempfile::TempDir;
@@ -15,11 +33,13 @@ pub mod network;
 
 const STDOUT_LOG: &str = "stdout.log";
 const STDERR_LOG: &str = "stderr.log";
+pub(crate) const LIGHTWALLETD_LOG: &str = "lwd.log";
 
 #[derive(Clone, Copy)]
 enum Process {
     Zcashd,
     Zainod,
+    Lightwalletd,
 }
 
 impl std::fmt::Display for Process {
@@ -27,38 +47,56 @@ impl std::fmt::Display for Process {
         let process = match self {
             Self::Zcashd => "zcashd",
             Self::Zainod => "zainod",
+            Self::Lightwalletd => "lightwalletd",
         };
         write!(f, "{}", process)
     }
 }
 
-fn wait_for_launch(
-    process: Process,
-    handle: &mut Child,
-    success_indicator: &str,
-    error_indicator: &str,
-) -> Result<TempDir, LaunchError> {
-    let logs_dir = tempfile::tempdir().unwrap();
+fn print_log(log_path: PathBuf) {
+    let mut log_file = File::open(log_path).unwrap();
+    let mut log = String::new();
+    log_file.read_to_string(&mut log).unwrap();
+    println!("{}", log);
+}
 
+fn write_logs(handle: &mut Child, logs_dir: &TempDir) {
     let stdout_log_path = logs_dir.path().join(STDOUT_LOG);
     let mut stdout_log = File::create(&stdout_log_path).unwrap();
     let mut stdout = handle.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        std::io::copy(&mut stdout, &mut stdout_log)
-            .expect("should be able to read/write stdout log");
-    });
-    let mut stdout_log = File::open(stdout_log_path).expect("should be able to open log");
-    let mut stdout = String::new();
+    std::thread::spawn(move || std::io::copy(&mut stdout, &mut stdout_log).unwrap());
 
     let stderr_log_path = logs_dir.path().join(STDERR_LOG);
     let mut stderr_log = File::create(&stderr_log_path).unwrap();
     let mut stderr = handle.stderr.take().unwrap();
-    std::thread::spawn(move || {
-        std::io::copy(&mut stderr, &mut stderr_log)
-            .expect("should be able to read/write stderr log");
-    });
+    std::thread::spawn(move || std::io::copy(&mut stderr, &mut stderr_log).unwrap());
+}
+
+fn wait_for_launch(
+    process: Process,
+    handle: &mut Child,
+    logs_dir: &TempDir,
+    additional_log_path: Option<PathBuf>,
+    success_indicator: &str,
+    error_indicator: &str,
+) -> Result<(), LaunchError> {
+    let stdout_log_path = logs_dir.path().join(STDOUT_LOG);
+    let mut stdout_log = File::open(stdout_log_path).expect("should be able to open log");
+    let mut stdout = String::new();
+
+    let stderr_log_path = logs_dir.path().join(STDERR_LOG);
     let mut stderr_log = File::open(stderr_log_path).expect("should be able to open log");
     let mut stderr = String::new();
+
+    let (mut additional_log_file, mut additional_log) = if let Some(log_path) = additional_log_path
+    {
+        let log_file = File::open(log_path).expect("should be able to open log");
+        let log = String::new();
+
+        (Some(log_file), Some(log))
+    } else {
+        (None, None)
+    };
 
     // wait for stdout log entry that indicates daemon is ready
     let interval = std::time::Duration::from_millis(100);
@@ -90,19 +128,106 @@ fn wait_for_launch(
             break;
         }
 
+        if additional_log_file.is_some() {
+            let mut log_file = additional_log_file
+                .take()
+                .expect("additional log exists in this scope");
+            let mut log = additional_log
+                .take()
+                .expect("additional log exists in this scope");
+
+            log_file.read_to_string(&mut log).unwrap();
+            if log.contains(success_indicator) {
+                // launch successful
+                break;
+            } else {
+                additional_log_file = Some(log_file);
+                additional_log = Some(log);
+            }
+        }
+
         std::thread::sleep(interval);
     }
 
-    Ok(logs_dir)
+    Ok(())
+}
+
+/// Functionality for validator/full-node processes.
+pub trait Validator {
+    /// Config filename
+    const CONFIG_FILENAME: &str;
+
+    /// Stops the process.
+    fn stop(&mut self);
+
+    /// Generate `n` blocks.
+    fn generate_blocks(&self, n: u32) -> std::io::Result<std::process::Output>;
+
+    /// Get temporary config directory.
+    fn config_dir(&self) -> &TempDir;
+
+    /// Get temporary logs directory.
+    fn logs_dir(&self) -> &TempDir;
+
+    /// Returns path to config file.
+    fn config_path(&self) -> PathBuf {
+        self.config_dir().path().join(Self::CONFIG_FILENAME)
+    }
+
+    /// Prints the stdout log.
+    fn print_stdout(&self) {
+        let stdout_log_path = self.logs_dir().path().join(STDOUT_LOG);
+        print_log(stdout_log_path);
+    }
+
+    /// Prints the stdout log.
+    fn print_stderr(&self) {
+        let stdout_log_path = self.logs_dir().path().join(STDERR_LOG);
+        print_log(stdout_log_path);
+    }
+}
+
+/// Functionality for indexer/light-node processes.
+pub trait Indexer {
+    /// Config filename
+    const CONFIG_FILENAME: &str;
+
+    /// Stops the process.
+    fn stop(&mut self);
+
+    /// Get temporary config directory.
+    fn config_dir(&self) -> &TempDir;
+
+    /// Get temporary logs directory.
+    fn logs_dir(&self) -> &TempDir;
+
+    /// Returns path to config file.
+    fn config_path(&self) -> PathBuf {
+        self.config_dir().path().join(Self::CONFIG_FILENAME)
+    }
+
+    /// Prints the stdout log.
+    fn print_stdout(&self) {
+        let stdout_log_path = self.logs_dir().path().join(STDOUT_LOG);
+        print_log(stdout_log_path);
+    }
+
+    /// Prints the stdout log.
+    fn print_stderr(&self) {
+        let stdout_log_path = self.logs_dir().path().join(STDERR_LOG);
+        print_log(stdout_log_path);
+    }
 }
 
 /// This struct is used to represent and manage the Zcashd process.
-#[derive(Getters)]
+#[derive(Getters, CopyGetters)]
 #[getset(get = "pub")]
 pub struct Zcashd {
     /// Child process handle
     handle: Child,
     /// RPC Port
+    #[getset(skip)]
+    #[getset(get_copy = "pub")]
     port: Port,
     /// Data directory
     _data_dir: TempDir,
@@ -124,7 +249,7 @@ impl Zcashd {
     ///
     /// Use `activation_heights` to specify custom network upgrade activation heights
     ///
-    /// Use `miner_address` to specify the target address for the block rewards when blocks are generated.  
+    /// Use `miner_address` to specify the target address for the block rewards when blocks are generated.
     pub fn launch(
         zcashd_bin: Option<PathBuf>,
         zcash_cli_bin: Option<PathBuf>,
@@ -132,12 +257,13 @@ impl Zcashd {
         activation_heights: &ActivationHeights,
         miner_address: Option<&str>,
     ) -> Result<Zcashd, LaunchError> {
+        let data_dir = tempfile::tempdir().unwrap();
+        let logs_dir = tempfile::tempdir().unwrap();
+
         let port = network::pick_unused_port(rpc_port);
         let config_dir = tempfile::tempdir().unwrap();
         let config_file_path =
             config::zcashd(config_dir.path(), port, activation_heights, miner_address).unwrap();
-
-        let data_dir = tempfile::tempdir().unwrap();
 
         let mut command = match zcashd_bin {
             Some(path) => std::process::Command::new(path),
@@ -163,26 +289,30 @@ impl Zcashd {
 
         let mut handle = command.spawn().unwrap();
 
-        let logs_dir = wait_for_launch(
+        write_logs(&mut handle, &logs_dir);
+        wait_for_launch(
             Process::Zcashd,
             &mut handle,
+            &logs_dir,
+            None,
             "init message: Done loading",
             "Error:",
         )?;
 
-        Ok(Zcashd {
+        let zcashd = Zcashd {
             handle,
             port,
             _data_dir: data_dir,
             logs_dir,
             config_dir,
             zcash_cli_bin,
-        })
-    }
+        };
 
-    /// Returns path to config file.
-    pub fn config_path(&self) -> PathBuf {
-        self.config_dir.path().join(config::ZCASHD_FILENAME)
+        // generate genesis block
+        zcashd.generate_blocks(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        Ok(zcashd)
     }
 
     /// Runs a Zcash-cli command with the given `args`.
@@ -200,9 +330,12 @@ impl Zcashd {
         command.arg(format!("-conf={}", self.config_path().to_str().unwrap()));
         command.args(args).output()
     }
+}
 
-    /// Stops the Zcashd process.
-    pub fn stop(&mut self) {
+impl Validator for Zcashd {
+    const CONFIG_FILENAME: &str = config::ZCASHD_FILENAME;
+
+    fn stop(&mut self) {
         match self.zcash_cli_command(&["stop"]) {
             Ok(_) => {
                 if let Err(e) = self.handle.wait() {
@@ -223,18 +356,16 @@ impl Zcashd {
         }
     }
 
-    /// Generate `num_blocks` blocks.
-    pub fn generate_blocks(&self, num_blocks: u32) -> std::io::Result<std::process::Output> {
-        self.zcash_cli_command(&["generate", &num_blocks.to_string()])
+    fn generate_blocks(&self, n: u32) -> std::io::Result<std::process::Output> {
+        self.zcash_cli_command(&["generate", &n.to_string()])
     }
 
-    /// Prints the stdout log.
-    pub fn print_stdout(&self) {
-        let stdout_log_path = self.logs_dir.path().join(STDOUT_LOG);
-        let mut stdout_log = File::open(stdout_log_path).expect("should be able to open log");
-        let mut stdout = String::new();
-        stdout_log.read_to_string(&mut stdout).unwrap();
-        println!("{}", stdout);
+    fn config_dir(&self) -> &TempDir {
+        &self.config_dir
+    }
+
+    fn logs_dir(&self) -> &TempDir {
+        &self.logs_dir
     }
 }
 
@@ -253,12 +384,14 @@ impl Drop for Zcashd {
 }
 
 /// This struct is used to represent and manage the Zainod process.
-#[derive(Getters)]
+#[derive(Getters, CopyGetters)]
 #[getset(get = "pub")]
 pub struct Zainod {
     /// Child process handle
     handle: Child,
     /// RPC Port
+    #[getset(skip)]
+    #[getset(get_copy = "pub")]
     port: Port,
     /// Logs directory
     logs_dir: TempDir,
@@ -277,6 +410,8 @@ impl Zainod {
         listen_port: Option<Port>,
         validator_port: Port,
     ) -> Result<Zainod, LaunchError> {
+        let logs_dir = tempfile::tempdir().unwrap();
+
         let port = network::pick_unused_port(listen_port);
         let config_dir = tempfile::tempdir().unwrap();
         let config_file_path = config::zainod(config_dir.path(), port, validator_port).unwrap();
@@ -288,18 +423,22 @@ impl Zainod {
         command
             .args([
                 "--config",
-                format!(
-                    "{}",
-                    config_file_path.to_str().expect("should be valid UTF-8")
-                )
-                .as_str(),
+                config_file_path.to_str().expect("should be valid UTF-8"),
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         let mut handle = command.spawn().unwrap();
 
-        let logs_dir = wait_for_launch(Process::Zainod, &mut handle, "Server Ready.", "Error:")?;
+        write_logs(&mut handle, &logs_dir);
+        wait_for_launch(
+            Process::Zainod,
+            &mut handle,
+            &logs_dir,
+            None,
+            "Server Ready.",
+            "Error:",
+        )?;
 
         Ok(Zainod {
             handle,
@@ -308,36 +447,139 @@ impl Zainod {
             config_dir,
         })
     }
+}
 
-    /// Returns path to config file.
-    pub fn config_path(&self) -> PathBuf {
-        self.config_dir.path().join(config::ZAINOD_FILENAME)
-    }
+impl Indexer for Zainod {
+    const CONFIG_FILENAME: &str = config::ZAINOD_FILENAME;
 
-    /// Stops the Zcashd process.
-    pub fn stop(&mut self) {
+    fn stop(&mut self) {
         self.handle.kill().expect("zainod couldn't be killed")
     }
 
-    /// Prints the stdout log.
-    pub fn print_stdout(&self) {
-        let stdout_log_path = self.logs_dir.path().join(STDOUT_LOG);
-        let mut stdout_log = File::open(stdout_log_path).expect("should be able to open log");
-        let mut stdout = String::new();
-        stdout_log.read_to_string(&mut stdout).unwrap();
-        println!("{}", stdout);
+    fn config_dir(&self) -> &TempDir {
+        &self.config_dir
     }
-}
 
-impl Default for Zainod {
-    /// Default launch for Zainod.
-    /// Panics on failure.
-    fn default() -> Self {
-        Zainod::launch(None, None, 18232).unwrap()
+    fn logs_dir(&self) -> &TempDir {
+        &self.logs_dir
     }
 }
 
 impl Drop for Zainod {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// This struct is used to represent and manage the Lightwalletd process.
+#[derive(Getters, CopyGetters)]
+#[getset(get = "pub")]
+pub struct Lightwalletd {
+    /// Child process handle
+    handle: Child,
+    /// RPC Port
+    #[getset(skip)]
+    #[getset(get_copy = "pub")]
+    port: Port,
+    /// Data directory
+    _data_dir: TempDir,
+    /// Logs directory
+    logs_dir: TempDir,
+    /// Config directory
+    config_dir: TempDir,
+}
+
+impl Lightwalletd {
+    /// Launches Lightwalletd process and returns [`crate::Lightwalletd`] with the handle and associated directories.
+    ///
+    /// Use `fixed_port` to specify a port for Lightwalletd. Otherwise, a port is picked at random.
+    ///
+    /// The `validator_port` must be specified and the validator process must be running before launching Lightwalletd.
+    pub fn launch(
+        lightwalletd_bin: Option<PathBuf>,
+        listen_port: Option<Port>,
+        validator_conf: PathBuf,
+    ) -> Result<Lightwalletd, LaunchError> {
+        let logs_dir = tempfile::tempdir().unwrap();
+        let lwd_log_file_path = logs_dir.path().join(LIGHTWALLETD_LOG);
+        let _lwd_log_file = File::create(&lwd_log_file_path).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let port = network::pick_unused_port(listen_port);
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_file_path = config::lightwalletd(
+            config_dir.path(),
+            port,
+            lwd_log_file_path.clone(),
+            validator_conf.clone(),
+        )
+        .unwrap();
+
+        let mut command = match lightwalletd_bin {
+            Some(path) => std::process::Command::new(path),
+            None => std::process::Command::new("lightwalletd"),
+        };
+        command
+            .args([
+                "--no-tls-very-insecure",
+                "--data-dir",
+                data_dir.path().to_str().unwrap(),
+                "--log-file",
+                lwd_log_file_path.to_str().unwrap(),
+                "--zcash-conf-path",
+                validator_conf.to_str().unwrap(),
+                "--config",
+                config_file_path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut handle = command.spawn().unwrap();
+
+        write_logs(&mut handle, &logs_dir);
+        wait_for_launch(
+            Process::Lightwalletd,
+            &mut handle,
+            &logs_dir,
+            Some(lwd_log_file_path),
+            "Starting insecure no-TLS (plaintext) server",
+            "Error:",
+        )?;
+
+        Ok(Lightwalletd {
+            handle,
+            port,
+            _data_dir: data_dir,
+            logs_dir,
+            config_dir,
+        })
+    }
+
+    /// Prints the stdout log.
+    pub fn print_lwd_log(&self) {
+        let stdout_log_path = self.logs_dir.path().join(LIGHTWALLETD_LOG);
+        print_log(stdout_log_path);
+    }
+}
+
+impl Indexer for Lightwalletd {
+    const CONFIG_FILENAME: &str = config::LIGHTWALLETD_FILENAME;
+
+    fn stop(&mut self) {
+        self.handle.kill().expect("zainod couldn't be killed")
+    }
+
+    fn config_dir(&self) -> &TempDir {
+        &self.config_dir
+    }
+
+    fn logs_dir(&self) -> &TempDir {
+        &self.logs_dir
+    }
+}
+
+impl Drop for Lightwalletd {
     fn drop(&mut self) {
         self.stop();
     }
